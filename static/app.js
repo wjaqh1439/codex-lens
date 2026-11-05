@@ -16,6 +16,10 @@
   appHome.textContent = BOOT.name || 'Codex Lens';
   appHome.addEventListener('click', function () { go('#/'); });
   document.getElementById('app-projects').addEventListener('click', function () { go('#/files'); });
+  document.getElementById('app-case').addEventListener('click', function () {
+    var c = lsGet('fde.lastCwd', '');
+    if (parseHash().path !== '/case') go('#/case' + (c ? '?cwd=' + encodeURIComponent(c) : ''));
+  });
   document.getElementById('app-models').addEventListener('click', function () { if (parseHash().path !== '/models') go('#/models'); });
   appPorts.addEventListener('click', function () { go(portsUrl()); });
   function refreshAppPorts() {
@@ -250,7 +254,7 @@
     try { var v = JSON.parse(sessionStorage.getItem(LS + 'scroll.' + navKey) || 'null'); return v ? v.y : null; } catch (e) { return null; }
   }
   // 오른쪽 창 화면(세션·새 세션·문서·파일) 사이를 몇 번 들어왔는지 — 나란히 보기의 ‹ 단추가 이걸 보고 나온다(history state 의 d)
-  function isPanePath(path) { return /^\/s\//.test(path) || path === '/new' || path === '/md' || path === '/files' || path === '/models' || path === '/ports' || path === '/web'; }
+  function isPanePath(path) { return /^\/s\//.test(path) || path === '/new' || path === '/md' || path === '/files' || path === '/models' || path === '/ports' || path === '/web' || path === '/case'; }
   function paneDepth() { return (history.state && history.state.d) || 0; }
   function go(hash, replace) {
     clearTimeout(scrollSaveTimer);
@@ -347,6 +351,11 @@
     if (isSplit()) go(sessionList().url());
     else if (history.length > 1 && S.cameFromApp) history.back(); else go(sessionList().url(), true);
   });
+  // FDE 케이스 화면(static/fde.js)에 넘기는 공용 도우미
+  function fdeCtx() {
+    return { el: el, btn: btn, api: api, toast: toast, setHeader: setHeader, go: go, restoreScroll: restoreScroll, S: S, view: view,
+      md: md, lsGet: lsGet, lsSet: lsSet, uuid4: uuid4, clientLog: clientLog };
+  }
   function render(pop) {
     S.cleanup.forEach(function (f) { try { f(); } catch (e) {} });
     S.cleanup = [];
@@ -364,6 +373,7 @@
     else if (r.path === '/models') viewModels(r.params, pop);
     else if (r.path === '/ports') viewPorts(r.params, pop);
     else if (r.path === '/web') viewWeb(r.params, pop);
+    else if (r.path === '/case') window.CodexFde.view(fdeCtx(), r.params, pop);
     else viewList(r.params, pop);
     document.documentElement.classList.toggle('web', r.path === '/web');
     if (LIST) LIST.setActive(sid || ((r.path === '/md' || r.path === '/files' || r.path === '/ports' || r.path === '/web') && r.params.from) || null);
@@ -1633,7 +1643,8 @@
       // agent-hub 가 돌리는 턴이면 보내기·멈춤이 그쪽으로 간다는 것을 선택줄 앞에 적는다
       setVia: function (via) {
         steerLead.textContent = via ? via + ' 응답 중 · 보내면' : '응답 중에 보내면';
-        stop.title = via ? via + ' 에서 진행 중인 턴을 멈춘다 — ' + via + ' 대기열도 비운다' : '진행 중인 턴을 멈춘다 — 기다리는 메시지는 남는다';
+        stop.title = via === 'agent-hub' ? via + ' 에서 진행 중인 턴을 멈춘다 — ' + via + ' 대기열도 비운다'
+          : via ? via + ' 에서 진행 중인 턴을 멈춘다' : '진행 중인 턴을 멈춘다 — 기다리는 메시지는 남는다';
       },
       // 멈출 수 없는 턴(이 앱이 쥐지 않은 다른 곳의 턴)이면 멈춤을 숨긴다 — 바로 넣기·턴 끝나고는 그대로 쓴다
       setCanStop: function (can) { can = !!can; if (can !== canStop) { canStop = can; paint(); } },
@@ -2135,7 +2146,8 @@
         return api('POST', '/api/sessions/' + encodeURIComponent(sid) + '/turns', body, true).then(function (r) {
           setRunningUi(true);
           if (r.hub) {
-            toast(r.steered ? 'agent-hub 의 진행 중인 턴에 넣었습니다' : body.mode === 'queue' ? 'agent-hub 에서 이 턴이 끝나면 보냅니다' : '지금 턴에 넣지 못해 agent-hub 가 다음 턴으로 보냅니다');
+            var via = r.via || 'agent-hub';
+            toast(r.steered ? via + ' 의 진행 중인 턴에 넣었습니다' : body.mode === 'queue' ? via + ' 에서 이 턴이 끝나면 보냅니다' : '지금 턴에 넣지 못해 ' + via + ' 가 다음 턴으로 보냅니다');
             clearTimeout(pollTimer); pollTimer = setTimeout(function () { load(false); }, 1200);
           } else if (r.queued) toast(body.mode === 'queue' ? '이 턴이 끝나면 보냅니다' : '지금 턴에 넣지 못해 다음 턴으로 보냅니다');
           var ids = lsGet('mdInputIds', {}); body.comment_ids.forEach(function (id) { delete ids[id]; }); lsSet('mdInputIds', ids);
@@ -2155,7 +2167,7 @@
       var q = X.queue || [], box = comp.queueEl, hubQ = X.hubRun ? X.data.hub.pending : 0;
       box.innerHTML = ''; box.hidden = !q.length && !hubQ;
       // agent-hub 대기열은 글을 받지 않고 개수만 안다 — 꺼내기·빼기는 agent-hub 에서 한다
-      if (hubQ) box.appendChild(el('div', 'queue-head', 'agent-hub 에서 턴이 끝나면 차례로 보냄 · ' + hubQ));
+      if (hubQ) box.appendChild(el('div', 'queue-head', (X.data.hub.via || 'agent-hub') + ' 에서 턴이 끝나면 차례로 보냄 · ' + hubQ));
       if (!q.length) return;
       box.appendChild(el('div', 'queue-head', X.running ? '턴이 끝나면 차례로 보냄 · ' + q.length : '보내지 않고 기다리는 중 · ' + q.length));
       q.forEach(function (it) {
@@ -2242,7 +2254,7 @@
         }
         var last = d.turns[d.turns.length - 1];
         // 다른 곳에서 도는 턴(agent-hub 채팅이거나 CLI·Codex 앱) — 이 앱에서 도는 턴과 같이 바로 넣기·턴 끝나고를 고른다.
-        // agent-hub 면 그쪽으로 넣고 멈출 수 있고, 아니면 다른 프로세스의 턴이라 끼워 넣거나 멈추지 못해 대기열에 둔다(서버가 정한다).
+        // agent-hub·steward 면 그쪽으로 넣고 멈출 수 있고, 아니면 다른 프로세스의 턴이라 끼워 넣거나 멈추지 못해 대기열에 둔다(서버가 정한다).
         var ext = !!(last && last.status === 'inProgress' && last.external && !last.live);
         X.hubRun = !!(d.hub && d.hub.running) && !(last && last.live);
         X.running = !!(last && last.status === 'inProgress') || X.hubRun;
@@ -2250,7 +2262,7 @@
         comp.setRunning((X.running && !!(last && last.live)) || X.hubRun || ext);
         X.extRun = ext && !X.hubRun;   // 이 앱이 쥐지 않은 턴 — 끼워 넣기·멈춤을 못 한다
         comp.setCanStop(!X.extRun);
-        comp.setVia(X.hubRun ? 'agent-hub' : '');
+        comp.setVia(X.hubRun ? (d.hub.via || 'agent-hub') : '');
         comp.setBlocked(d.session.readonly ? '하위 에이전트 기록 — 읽기만 됩니다. 이어서 시키려면 상위 세션에서 말하세요' : null);
         X.queue = d.queue || []; paintQueue();
         refreshReports();
@@ -3715,16 +3727,18 @@
     function open() {
       t0 = performance.now();
       clearInterval(tick); tick = setInterval(paint, 1000); paint();
-      api('GET', '/api/web/resolve?url=' + encodeURIComponent(url)).then(function (r) { return r; }, function () { return { url: url }; }).then(function (r) {
+      api('GET', '/api/web/resolve?url=' + encodeURIComponent(url) + '&via=' + encodeURIComponent(location.origin)).then(function (r) { return r; }, function () { return { url: url }; }).then(function (r) {
         if (seq !== S.seq) return;
         var local = !!r.local, appLocal = isLoopback(location.hostname);
-        target = current = r.url || url; via = r.changed ? 'https' : r.reason || '';
+        target = current = r.url || url; via = r.changed ? (r.via || 'https') : r.reason || '';
         S.webDepth = 0; histLen = history.length;
         if (r.changed) head(target); else showAddr();
         if (r.reason === 'down') { frame.remove(); return say(u.host + ' 에서 응답하는 서버가 없습니다 — 서버가 꺼졌거나 포트가 바뀌었습니다', true); }
         if (local && !r.changed && (r.reason === 'no_https' || r.reason === 'no_tailscale') && !appLocal) {
           frame.remove();
-          return say(u.host + ' 는 Codex 를 돌리는 기기 안에서만 열립니다 — 그 포트에 붙은 HTTPS 주소(tailscale serve)가 없습니다', true);
+          var alt = location.hostname + ':' + (u.port || (u.protocol === 'https:' ? '443' : '80'));
+          return say(u.host + ' 는 Codex 를 돌리는 기기 안에서만 열립니다 — ' + alt + ' 로도 닿지 않습니다(서버가 127.0.0.1 에만 묶였거나 방화벽이 막음)'
+            + (r.reason === 'no_https' ? ', 그 포트에 붙은 HTTPS 주소(tailscale serve)도 없습니다' : ''), true);
         }
         // HTTPS 로 연 앱 안에서는 http 주소(루프백 제외)를 브라우저가 막는다(혼합 콘텐츠)
         var t = new URL(target);
@@ -3751,8 +3765,18 @@
   var PORT_STATE = { starting: '여는 중', listening: '열림', exited: '끝남', stopped: '꺼짐' };
   function portsUrl(p) { return '#/ports' + qs(p || {}); }
   function portRunning(e) { return e.state === 'starting' || e.state === 'listening'; }
+  // 앱을 연 주소가 호스트 이름에 포트를 담는 프록시(e2b `8761-<샌드박스>.e2b.app` 등)면 그 자리만 바꾼 origin — weblink.proxied_origin 과 같은 규칙
+  function proxiedOrigin(port) {
+    var h = location.hostname || '', i = h.indexOf('.'), ap = String(BOOT.port || '');
+    if (!ap || i < 0 || isLoopback(h) || /^[\d.]+$|:/.test(h)) return null;
+    var re = new RegExp('(^|[^0-9])' + ap + '(?![0-9])', 'g'), first = h.slice(0, i);
+    if ((first.match(re) || []).length !== 1) return null;
+    return location.protocol + '//' + first.replace(re, '$1' + port) + h.slice(i) + (location.port ? ':' + location.port : '');
+  }
   function portHref(e) {
     if (e.url) return e.url;   // 서버가 붙인 바깥 주소(CODEX_LENS_PUBLIC_URL · 내보내기)
+    var px = proxiedOrigin(e.port);
+    if (px) return px + '/';
     var h = location.hostname || '127.0.0.1';
     return 'http://' + (h.indexOf(':') >= 0 ? '[' + h + ']' : h) + ':' + e.port + '/';
   }

@@ -26,12 +26,14 @@ import uuid
 
 import applog
 import claude_history as ch
+import output_protocol
 from codex_rpc import RpcError
 
 PERMISSION_MODE = os.environ.get("CODEX_LENS_CLAUDE_PERMISSION_MODE", "bypassPermissions")
 READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "WebSearch", "WebFetch", "Bash(git log:*)", "Bash(git show:*)",
                    "Bash(git diff:*)", "Bash(git status:*)", "Bash(git blame:*)", "Bash(ls:*)", "Bash(cat:*)",
-                   "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)", "Bash(rg:*)", "Bash(grep:*)"]
+                   "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)", "Bash(rg:*)", "Bash(grep:*)",
+                   "StructuredOutput"]   # 규약을 건 세션의 포크는 답을 이 도구로 낸다
 INTERRUPT_GRACE_SEC = 8
 MISS_CACHE_SEC = 15
 READ_ONLY = "하위 에이전트 기록은 읽기만 됩니다 — 이어서 시키려면 상위 세션에서 말하세요"
@@ -101,6 +103,7 @@ class Run:
         self.pending = {}          # 끼워 넣은 말 uuid -> (client id, 입력)
         self.tools = {}            # tool_use id -> 진행 중 항목
         self.answers = set()       # StructuredOutput 처럼 답으로 바꾼 도구 id
+        self.stream_answers = {}   # 스트림 블록 id -> 흘러오는 StructuredOutput 도구 id
         self.sub_signal = 0        # 하위 에이전트 소식을 마지막으로 부모 항목에 알린 시각
         self.block = {}            # 메시지 id -> 지금 스트림 중인 블록 번호
         self.count = {}            # 메시지 id -> 다음 블록 번호(스트림 이벤트가 없을 때)
@@ -130,6 +133,8 @@ class Run:
             a += ["--model", model]
         if self.effort:
             a += ["--effort", self.effort]
+        if c.output_for(th):
+            a += ["--json-schema", output_protocol.schema_json()]
         extra = c.instructions_for(th)
         if extra:
             a += ["--append-system-prompt", extra]
@@ -322,6 +327,10 @@ class Run:
                 iid = "%s:%d" % (self.cur_msg, idx)
                 if cb.get("type") == "text":
                     self.emit("item/started", {"item": ch.text_item(iid, "")})
+                elif cb.get("type") == "tool_use" and cb.get("name") == output_protocol.CLAUDE_TOOL and cb.get("id"):
+                    # 최종 답(규약 JSON)이 도구 입력으로 흘러온다 — 답 항목으로 보이고 본문은 turns.unwrap_output 이 풀어 낸다
+                    self.stream_answers[iid] = cb["id"]
+                    self.emit("item/started", {"item": dict(ch.text_item(cb["id"], ""), phase="final_answer")})
                 elif cb.get("type") in ("thinking", "redacted_thinking"):
                     self.emit("item/started", {"item": ch.thinking_item(iid, "")})
             elif et == "content_block_delta" and self.cur_msg:
@@ -329,6 +338,8 @@ class Run:
                 iid = "%s:%d" % (self.cur_msg, ev.get("index", 0))
                 if d.get("type") == "text_delta" and d.get("text"):
                     self.emit("item/agentMessage/delta", {"itemId": iid, "delta": d["text"]})
+                elif d.get("type") == "input_json_delta" and d.get("partial_json") and iid in self.stream_answers:
+                    self.emit("item/agentMessage/delta", {"itemId": self.stream_answers[iid], "delta": d["partial_json"]})
                 elif d.get("type") == "thinking_delta" and d.get("thinking"):
                     self.emit("item/reasoning/summaryTextDelta", {"itemId": iid, "delta": d["thinking"], "summaryIndex": 0})
             return
@@ -408,6 +419,8 @@ class Run:
                 errs = o.get("errors")
                 msg = o.get("result") or ("; ".join(map(str, errs)) if isinstance(errs, list) and errs else "") \
                     or o.get("subtype") or "실패"
+                if o.get("subtype") == output_protocol.EXHAUSTED:
+                    msg = "최종 답이 출력 규약(agent-output/1) 검증을 끝내 통과하지 못했습니다 — " + str(msg)
                 self._finish("failed", str(msg)[:2000])
 
     def _emit_context(self):
@@ -435,7 +448,8 @@ class ClaudeClient:
 
     agent = "claude"
 
-    def __init__(self, root=None, argv=None, env=None, stderr_path=None, list_filter=None, instructions=None):
+    def __init__(self, root=None, argv=None, env=None, stderr_path=None, list_filter=None, instructions=None,
+                 output_schema=None):
         env_argv = os.environ.get("CODEX_LENS_CLAUDE_ARGV")
         self.argv = argv or (json.loads(env_argv) if env_argv else [os.environ.get("CODEX_LENS_CLAUDE_BIN", "claude")])
         self.env = env
@@ -446,6 +460,8 @@ class ClaudeClient:
         # fn(id) -> 덧붙일 시스템 지침(포트 관리) 또는 None. 포크는 원본 세션 기준으로 물어 원본과 같은 시스템
         # 프롬프트로 돌아야 캐시를 읽는다 — 그래서 지침은 이 앱이 만든 세션에만 주고(Lens), 턴마다 같은 값을 준다
         self.instructions = instructions
+        # 세션 id -> 최종 답을 agent-output 규약으로 강제하는지(--json-schema). 포크는 원본을 따른다 — 도구 정의가 같아야 캐시를 읽는다
+        self.output_schema = output_schema
         self.listeners = []
         self.request_handlers = []
         self.loaded = set()
@@ -458,6 +474,14 @@ class ClaudeClient:
         self.metas = {}        # 파일 -> 목록 메타 (mtime·크기가 같으면 다시 쓴다)
         self.reads = {}        # 파일 -> (활동 시각, 크기, live, 프로세스, 턴, 정보)
         self._models = None
+
+    def output_for(self, th):
+        if not self.output_schema:
+            return False
+        try:
+            return bool(self.output_schema(th.get("forked_from") or th["id"]))
+        except Exception:
+            return False
 
     def instructions_for(self, th):
         if not self.instructions:

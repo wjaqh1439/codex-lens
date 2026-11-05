@@ -127,7 +127,7 @@ class JobManager:
         return self.store.read()["jobs"]
 
     def public(self, j):
-        out = {k: v for k, v in j.items() if not k.startswith("_")}
+        out = {k: v for k, v in j.items() if not k.startswith("_") and not (k == "prompt" and j.get("kind") == "fde")}
         if j.get("status") == "running":
             now = _now()
             out["elapsed_sec"] = round(now - j.get("started_at", now), 1)
@@ -137,7 +137,7 @@ class JobManager:
 
     def for_thread(self, tid):
         with self.lock:
-            jobs = [self.public(j) for j in self._jobs().values() if j.get("thread_id") == tid and j.get("kind") != "refine"]
+            jobs = [self.public(j) for j in self._jobs().values() if j.get("thread_id") == tid and j.get("kind") not in ("refine", "fde")]
         jobs.sort(key=lambda j: j.get("created_at", 0))
         return jobs
 
@@ -218,6 +218,14 @@ class JobManager:
             extra["tier"] = None   # Claude 에는 속도 등급이 없다
         return self._start(tid, turn_id, "refine", body.get("client_id"), meta=meta, **extra)
 
+    def start_fde(self, cwd, prompt, step, agent=None, model=None, effort=None, client_id=None):
+        """FDE 케이스 단계 작업(fde.py) — 작업 폴더에서 일회용 읽기 전용 세션으로 한 턴을 돌린다.
+        결과 해석·반영은 fde.Fde 가 케이스를 읽을 때 한다. effort 를 고르지 않으면 넘기지 않는다(모델 기본)."""
+        agent = "claude" if agent == "claude" else "codex"
+        model = model or self.lens.model_settings()["defaults"][agent]["model"] or None
+        meta = {"model": model, "cwd": cwd, "agent": agent}
+        return self._start(None, None, "fde", client_id, meta=meta, prompt=prompt, step=step, effort=effort or None)
+
     def _start(self, tid, turn_id, kind, client_id, meta=None, **extra):
         jid = client_id or uuid.uuid4().hex[:16]
         with self.lock:
@@ -261,7 +269,7 @@ class JobManager:
         j["version"] = j.get("version", 0) + 1
 
     def _publish(self, j, now=False):
-        if j.get("kind") == "refine":   # 화면이 GET /api/jobs/<id> 로 따라 읽는다
+        if j.get("kind") in ("refine", "fde"):   # 화면이 GET /api/jobs/<id>(fde 는 케이스)로 따라 읽는다
             return
         if now:
             self.lens.bus.publish(j["thread_id"], {"type": "job", "job": self.public(j)})
@@ -284,7 +292,7 @@ class JobManager:
                 if j.get("status") == "running" and j["id"] not in ids:
                     out.append(j)
         for j in out:
-            if j.get("kind") == "refine":
+            if j.get("kind") in ("refine", "fde"):
                 continue
             self.lens.bus.publish(j["thread_id"], {"type": "job", "job": self.public(j)})
 
@@ -313,7 +321,8 @@ class JobManager:
                     self._stage(j, "answering")
                     j["first_token_ms"] = int((_now() - j["started_at"]) * 1000)
                 j["_partial"] = j.get("_partial", "") + (params.get("delta") or "")
-                j["answer"] = j["_partial"]
+                from turns import unwrap_output
+                j["answer"] = unwrap_output(j["_partial"])   # 규약을 건 세션의 포크는 답이 JSON 으로 흘러온다
             elif method == "item/reasoning/summaryTextDelta":
                 j["_think"] = (j.get("_think", "") + (params.get("delta") or ""))[-400:]
                 head = j["_think"].strip().split("\n")[0].strip("* ")
@@ -390,6 +399,8 @@ class JobManager:
         return p
 
     def _prompt(self, j):
+        if j["kind"] == "fde":
+            return j["prompt"]
         if j["kind"] == "refine":
             return refine.build_prompt(j["text"], bool(j.get("turn_id")), j.get("cwd") or "", j.get("context_answers"),
                                        j.get("mode"), j.get("prompt"))
@@ -431,7 +442,7 @@ class JobManager:
                     reused = True
             if not fork:
                 eph = j["kind"] != "question"
-                if j["kind"] == "refine" and not j.get("turn_id"):
+                if j["kind"] in ("refine", "fde") and not j.get("turn_id"):
                     # 이을 턴이 없다(새 세션·턴 없는 세션) — 일회용 빈 세션
                     p = {"cwd": j.get("cwd"), "ephemeral": True, "sandbox": "read-only", "approvalPolicy": "on-request",
                          "agent": j.get("agent") or "codex"}
@@ -512,6 +523,8 @@ class JobManager:
                 j["finished_at"] = _now()
                 for k in [k for k in j if k.startswith("_")]:
                     j.pop(k, None)
+                if j["kind"] == "fde":   # 케이스 원문이 담긴 큰 글 — 끝나면 길이만 남긴다
+                    j["prompt_chars"] = len(j.pop("prompt", "") or "")
                 self.store.save()
             if j["kind"] != "question" and fork:
                 try:

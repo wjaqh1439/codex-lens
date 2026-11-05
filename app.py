@@ -25,9 +25,11 @@ import refine  # noqa: E402
 import weblink  # noqa: E402
 from codex_rpc import RpcError  # noqa: E402
 from docs import Docs  # noqa: E402
+from fde import Fde  # noqa: E402
 from hub_link import HubError, HubLink  # noqa: E402
 from lens import STANDARD_TIER, Busy, Lens  # noqa: E402
 from ports import Ports  # noqa: E402
+from steward_link import StewardLink, default_home as steward_home  # noqa: E402
 
 VERSION = open(os.path.join(ROOT, "VERSION")).read().strip()
 DEMO = os.environ.get("CODEX_LENS_DEMO") == "1"
@@ -131,14 +133,17 @@ def read_text(path):
 
 
 class App:
-    def __init__(self, lens=None, hub_url=None):
+    def __init__(self, lens=None, hub_url=None, steward_dir=None):
         applog.setup(os.path.join(HOME, "logs", "app.jsonl"), version=VERSION, env="demo" if DEMO else "production")
         if lens is None:
             cenv, mine_only = claude_env()
             lens = Lens(HOME, VERSION, demo=DEMO, codex_env=codex_env(), claude_env=cenv, claude_mine_only=mine_only)
         self.lens = lens
         self.docs = Docs(self.lens)
+        self.fde = Fde(self.lens)
         self.hub = HubLink(HUB_URL if hub_url is None else hub_url)
+        # steward 가 돌리는 세션도 같은 길로 넘긴다(steward_link.py) — 데모는 운영 steward 에 닿지 않게 기본으로 끈다
+        self.steward = StewardLink(steward_home(DEMO) if steward_dir is None else steward_dir)
         self.ports = Ports(HOME, HOST, notify=self._ports_changed)
         if not os.environ.get("CODEX_LENS_NO_PORT_HINT"):
             self.lens.dev_instructions = port_instructions()
@@ -157,7 +162,7 @@ class App:
             widget = ('<script src="%s/feedback-widget.js?v=%s" data-project-id="codex-lens" data-project-name="%s" '
                       'data-app-version="%s" data-environment="%s" data-endpoint="%s/api/feedback" defer></script>'
                       % (FEEDBACK_ORIGIN, VERSION, APP_NAME, VERSION, "demo" if DEMO else "production", FEEDBACK_ORIGIN))
-        boot = json.dumps({"version": VERSION, "demo": DEMO, "name": APP_NAME, "home": os.path.expanduser("~")})
+        boot = json.dumps({"version": VERSION, "demo": DEMO, "name": APP_NAME, "home": os.path.expanduser("~"), "port": PORT})
         return (html.replace("{{TITLE}}", title).replace("{{ICON}}", prefix).replace("{{VERSION}}", VERSION)
                 .replace("{{BOOT}}", boot).replace("{{DEMO_CLASS}}", " ".join(c for c in ("demo" if DEMO else "", "has-fb" if widget else "") if c))
                 .replace("{{FEEDBACK}}", widget))
@@ -215,7 +220,9 @@ def api_web_resolve(app, h, q):
         except KeyError:
             return None
         return app.ports.url_of(e) if e.get("state") in ("starting", "listening") else None
-    return weblink.resolve(q.get("url") or "", public_for=public_for)
+    via = q.get("via") or ((h.headers.get("X-Forwarded-Proto") or "http").split(",")[0].strip() + "://"
+                           + (h.headers.get("X-Forwarded-Host") or h.headers.get("Host") or "").split(",")[0].strip())
+    return weblink.resolve(q.get("url") or "", public_for=public_for, via=via, app_port=PORT)
 
 
 @route("GET", "/api/changelog")
@@ -316,7 +323,8 @@ def api_create(app, h, q):
 @route("GET", "/api/sessions/(?P<sid>[^/]+)")
 def api_session(app, h, q, sid):
     out = app.lens.read_session(sid)
-    out["hub"] = app.hub.chat_for(sid)
+    hub, st = app.hub.chat_for(sid), app.steward.chat_for(sid)   # steward 쪽은 도는 세션만 돌려준다
+    out["hub"] = st if st and not (hub and hub["running"]) else hub
     out["ports"] = [_port_brief(e) for e in app.ports.list(sid) if e["state"] in ("starting", "listening")]
     return out
 
@@ -330,12 +338,12 @@ def api_archive(app, h, q, sid):
 def api_send(app, h, q, sid):
     b = h.body()
     mode = b.get("mode") if b.get("mode") in ("steer", "queue") else None
-    hub = _hub_running(app, sid)
+    link, hub = _hub_running(app, sid)
     if hub:
-        # agent-hub 가 돌리는 턴 — 이 앱이 따로 턴을 열면 두 곳에서 동시에 돈다. 바로 넣기·대기열을 agent-hub 에 맡긴다.
+        # agent-hub·steward 가 돌리는 턴 — 이 앱이 따로 턴을 열면 두 곳에서 동시에 돈다. 바로 넣기·대기열을 그쪽에 맡긴다.
         if not (b.get("text") or "").strip() and not b.get("images"):
             raise ValueError("보낼 내용이 없습니다")
-        out = app.hub.send(sid, hub, _hub_text(app, sid, b.get("text"), b.get("mentions")), app.lens.validate_images(b.get("images")),
+        out = link.send(sid, hub, _hub_text(app, sid, b.get("text"), b.get("mentions")), app.lens.validate_images(b.get("images")),
                            mode or "queue", b.get("client_id"))
         app.lens.mark_sent(sid, set(b.get("comment_ids") or []))
         app.lens.bus.publish(sid, {"type": "comments"})
@@ -350,7 +358,7 @@ def api_send(app, h, q, sid):
 
 @route("POST", "/api/sessions/(?P<sid>[^/]+)/queue/(?P<qid>[^/]+)/send")
 def api_queue_send(app, h, q, sid, qid):
-    hub = _hub_running(app, sid)
+    link, hub = _hub_running(app, sid)
     if not hub:
         return app.lens.queue_send(sid, qid)
     # 이 앱의 대기열에 있던 말을 agent-hub 가 돌리는 턴에 넣는다 — 못 넣으면 제자리(맨 앞)로 돌려놓는다
@@ -358,7 +366,7 @@ def api_queue_send(app, h, q, sid, qid):
     if not e:
         raise KeyError(qid)
     try:
-        return app.hub.send(sid, hub, _hub_text(app, sid, e["text"], e.get("mentions")), e.get("images"), "steer", e.get("client_id"))
+        return link.send(sid, hub, _hub_text(app, sid, e["text"], e.get("mentions")), e.get("images"), "steer", e.get("client_id"))
     except Exception:
         app.lens.queues.update(lambda d: d["threads"].setdefault(sid, []).insert(0, e))
         app.lens._queue_changed(sid)
@@ -372,9 +380,9 @@ def api_queue_remove(app, h, q, sid, qid):
 
 @route("POST", "/api/sessions/(?P<sid>[^/]+)/interrupt")
 def api_interrupt(app, h, q, sid):
-    hub = _hub_running(app, sid)
+    link, hub = _hub_running(app, sid)
     if hub:
-        return app.hub.interrupt(sid, hub)
+        return link.interrupt(sid, hub)
     return app.lens.interrupt(sid)
 
 
@@ -384,11 +392,14 @@ def _hub_text(app, sid, text, mentions):
 
 
 def _hub_running(app, sid):
-    """이 앱이 돌리는 턴이 없고 agent-hub 가 그 세션의 턴을 돌리는 중이면 그 채팅."""
+    """이 앱이 돌리는 턴이 없고 agent-hub·steward 가 그 세션의 턴을 돌리는 중이면 (그 연결, 채팅). 아니면 (None, None)."""
     if app.lens._running(sid):
-        return None
-    hub = app.hub.chat_for(sid)
-    return hub if hub and hub["running"] else None
+        return None, None
+    for link in (app.hub, app.steward):
+        hub = link.chat_for(sid)
+        if hub and hub["running"]:
+            return link, hub
+    return None, None
 
 
 @route("GET", "/api/sessions/(?P<sid>[^/]+)/events")
@@ -511,6 +522,37 @@ def api_comment_patch(app, h, q, cid):
 @route("DELETE", "/api/comments/(?P<cid>[^/]+)")
 def api_comment_delete(app, h, q, cid):
     return {"deleted": app.lens.delete_comment(app.lens.comments, cid)}
+
+
+# --- FDE 케이스(fde.py) — 작업 폴더의 fde/case.json ------------------------
+@route("GET", "/api/fde")
+def api_fde(app, h, q):
+    return app.fde.view(q.get("cwd"))
+
+
+@route("POST", "/api/fde")
+def api_fde_create(app, h, q):
+    b = h.body()
+    return app.fde.create(b.get("cwd"), b)
+
+
+@route("POST", "/api/fde/step")
+def api_fde_step(app, h, q):
+    b = h.body()
+    return app.fde.step(b.get("cwd"), b)
+
+
+@route("POST", "/api/fde/act/(?P<action>[a-z_]+)")
+def api_fde_act(app, h, q, action):
+    b = h.body()
+    return app.fde.act(b.get("cwd"), action, b)
+
+
+@route("POST", "/api/fde/run")
+def api_fde_run(app, h, q):
+    b = h.body()
+    ids = b.get("ids") if isinstance(b.get("ids"), list) else []
+    return app.fde.run(b.get("cwd"), [str(x) for x in ids])
 
 
 @route("GET", "/api/files")

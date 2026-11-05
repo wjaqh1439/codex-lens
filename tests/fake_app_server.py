@@ -179,6 +179,8 @@ def run_turn(th, turn, text, model):
             turn["_steer_closed"] = True
         items += steers
         answer = fake_answer(text, [st["content"][0].get("text", "") for st in steers])
+        if turn.get("_schema"):
+            answer = protocol_answer(text, answer)
         msg_id = "msg_" + uuid.uuid4().hex[:8]
         note("item/started", {"threadId": tidv, "turnId": turn["id"], "item": {"type": "agentMessage", "id": msg_id, "text": "", "phase": "final_answer"}})
         for i in range(0, len(answer), 12):
@@ -212,9 +214,25 @@ def run_turn(th, turn, text, model):
         sys.stderr.write("fake turn error %r\n" % e)
 
 
+def protocol_answer(text, answer):
+    """outputSchema(agent-output/1)를 받은 턴의 최종 답 — 진짜 Codex 처럼 규약 JSON 하나로 낸다(가짜 Claude 도 쓴다).
+    요청에 "카드"가 있으면 할 일·정할 것·메인 반영을 채운다."""
+    obj = {"protocol": "agent-output/1", "body": answer, "todos": [], "decisions": [], "merge": None}
+    if "카드" in text:
+        obj["todos"] = [{"id": "t1", "title": "데모 서버 내리기", "detail": "확인이 끝나면 내린다", "owner": "agent", "project": None}]
+        obj["decisions"] = [{"id": "d1", "header": "적용 범위", "question": "규약을 기존 세션에도 걸까요?",
+                             "options": [{"label": "새 세션만", "description": "기존 세션의 조건을 지킨다", "recommended": True},
+                                         {"label": "모든 세션", "description": None, "recommended": False}],
+                             "multiSelect": False, "allowOther": True}]
+        obj["merge"] = {"summary": "최종 답 규약을 앱이 직접 강제한다", "bump": "minor", "version": None, "checks": ["단위 시험"]}
+    return json.dumps(obj, ensure_ascii=False)
+
+
 def fake_answer(text, steers=()):
     """요청 글에 맞는 가짜 답 — 가짜 Claude(fake_claude.py)도 같이 쓴다. steers: 끼워 넣은 말 글."""
-    if "[codex-lens · 문서 다듬기]" in text:
+    if text.startswith("[FDE 케이스 — codex-lens"):
+        answer = fake_fde(text)
+    elif "[codex-lens · 문서 다듬기]" in text:
         n = fake_refine(text)
         answer = "코멘트 %d개를 반영했습니다.\n\n1. 고른 부분 끝에 **다듬음** 표시를 붙였습니다." % n
     elif "[요청 다듬기" in text and '"text":"다듬은 글 전체"' in text:   # 좋은 글 목적
@@ -244,6 +262,46 @@ def fake_answer(text, steers=()):
             answer += "\n\n끼워 넣은 말도 읽었습니다: " + st[:80]
         answer *= int(os.environ.get('FAKE_STREAM_REPEAT') or 1)
     return answer
+
+
+def fake_fde(text):
+    """FDE 케이스 단계 흉내(understand · plan · ask) — 형식에 맞는 JSON. 피드백이 있으면 요지 앞에 '피드백 반영 · '."""
+    step = text.split("step=", 1)[1].split("]", 1)[0]
+    fb = "피드백 반영 · " if "[사용자 피드백" in text else ""
+    if "망가진 답" in text:
+        return "형식을 지키지 않은 답"
+    if step == "understand":
+        out = {"headline": fb + "점검원마다 근무 시간 안에 맡은 설비를 모두 도는 경로를 만드는 문제",
+               "summary": ["입력은 점검원 · 설비 · 이동 시간 표", "규칙은 하루 12대와 근무 시간", "좋은 경로의 기준은 아직 정해야 한다"],
+               "detail": "### 문제\n- 점검원별 경로와 시간표\n### 지킬 규칙\n- 하루 최대 12대\n### 아직 모르는 것\n- 점검 한 건에 걸리는 시간",
+               "sources": ["C1"],
+               "choices": [{"question": "총 이동 시간과 점검원 사이 업무량 균형 중 무엇을 먼저 볼까요?", "why": "최적화 목표의 순서를 정한다",
+                            "options": [{"label": "이동 시간 먼저", "effect": "이동 비용이 준다", "recommended": True},
+                                        {"label": "업무량 균형 먼저", "effect": "점검원 사이 차이가 준다"}]}]}
+    elif step == "plan":
+        v = text.count("[계획 v")
+        out = {"headline": fb + "설비 묶기 → 경로 순서 → 시간표, 핵심은 경로 구성" + (" (개선)" if v else ""),
+               "summary": ["경로 구성이 결과의 질을 정한다", "검증기는 생성 코드와 분리한다"], "detail": "### 왜 이 순서인가\n묶음이 정해져야 순서를 다듬을 수 있다.",
+               "sources": ["C1"],
+               "modules": [{"name": "데이터 검증", "role": "입력 무결성 확인"}, {"name": "경로 구성", "role": "한도 · 근무 시간을 지키며 묶고 순서 정하기", "main": True},
+                           {"name": "독립 검증기", "role": "규칙 위반 세기"}],
+               "algorithm": {"name": "탐욕 묶기 + 경계 재배정" if v else "탐욕 묶기 + 지역 개선",
+                             "idea": "가까운 설비부터 하루 한도까지 묶고, 2-opt 로 순서를 다듬는다." + (" 경계 설비를 이웃 경로로 옮겨 본다." if v else ""),
+                             "steps": ["설비 군집", "한도까지 탐욕 배정", "2-opt 순서 개선"], "weaknesses": ["군집 경계에서 점검원이 더 필요할 수 있다"]},
+               "criteria": [{"name": "규칙 위반", "metric": "violations", "why": "반드시 0"}, {"name": "총 이동 시간", "metric": "travel", "why": "이동 비용"},
+                            {"name": "구현 난이도", "metric": "", "why": "시간 제한"}],
+               "options": [{"name": "탐욕 + 지역 개선", "summary": "빠르고 단순", "eval": {"규칙 위반": "0 보장", "총 이동 시간": "보통", "구현 난이도": "쉬움"}},
+                           {"name": "정수 계획법", "summary": "최적에 가깝지만 느림", "eval": {"규칙 위반": "0 보장", "총 이동 시간": "좋음", "구현 난이도": "어려움"}}],
+               "checks": [{"name": "규칙 위반 세기", "command": "printf 'METRIC violations=0\\nMETRIC travel=%d\\n'" % (380 if v else 412)},
+                          {"name": "단위 시험", "command": "true"}],
+               "change": "경계 재배정을 더했다 — travel 을 줄이는 것이 목표" if v else "",
+               "choices": [{"question": "어느 해결 방법으로 갈까요?", "why": "구현할 방법을 정한다",
+                            "options": [{"label": "탐욕 + 지역 개선", "effect": "오늘 안에 검증까지 끝낸다", "recommended": True},
+                                        {"label": "정수 계획법", "effect": "품질이 오르지만 구현 위험이 크다"}]}]}
+    else:
+        q = text.split("[질문]\n", 1)[-1].split("\n\n---", 1)[0].strip()
+        out = {"headline": "답: " + q[:40], "summary": [], "detail": "**" + q[:200] + "** — 이해 카드의 규칙을 보면 된다.", "choices": []}
+    return json.dumps(out, ensure_ascii=False)
 
 
 def fake_refine(text):
@@ -351,6 +409,8 @@ def handle(req):
                 t["model"] = p["model"]
             turn = {"id": tid(), "status": "inProgress", "startedAt": now(), "completedAt": None, "durationMs": None, "error": None,
                     "items": [{"type": "userMessage", "id": uuid.uuid4().hex[:8], "clientId": p.get("clientUserMessageId"), "content": [dict(i) for i in p.get("input") or []]}]}
+            if p.get("outputSchema"):
+                turn["_schema"] = True   # 최종 메시지를 규약 JSON 으로(진짜는 제약 디코딩)
             t.setdefault("turns", []).append(turn)
             t["status"] = {"type": "active", "activeFlags": []}
             threading.Thread(target=run_turn, args=(t, turn, text, p.get("model") or t["model"]), daemon=True).start()

@@ -28,6 +28,7 @@ from store import JsonStore
 from stream_speed import StreamSpeed
 from codex_speed import RolloutRates, summarize as summarize_rates
 from context_usage import context_usage
+import output_protocol
 from turns import normalize_turn, quiet_until, subagent_title, unwrap_output
 
 # 목록에 보일 세션 출처. 세션이 띄운 하위 에이전트(subAgentThreadSpawn)는 부모 아래에 묶어 보이고,
@@ -223,7 +224,8 @@ class Lens:
         mine = lambda tid: tid in self.registry.read()["mine"]  # noqa: E731
         claude = ClaudeClient(argv=claude_argv, env=claude_env, list_filter=mine if claude_mine_only else None,
                               stderr_path=os.path.join(home, "logs", "claude-stderr.log"),
-                              instructions=lambda tid: self.dev_instructions if mine(tid) else None)
+                              instructions=lambda tid: self.instructions_for(tid, "claude") if mine(tid) else None,
+                              output_schema=lambda tid: self.output_on(tid))
         # 세션마다 Codex 또는 Claude Code 로 보낸다 — 아래 코드는 Codex app-server 의 메서드·알림 모양만 쓴다
         self.client = AgentRouter(codex, claude)
         self.client.listeners.append(self._on_note)
@@ -929,8 +931,10 @@ class Lens:
             params["model"] = model
         if tier:
             params["serviceTier"] = tier
-        if self.dev_instructions:
-            params["developerInstructions"] = self.dev_instructions
+        output = output_protocol.PROTOCOL if output_protocol.ENABLED else None
+        dev = self.instructions_for(None, agent, output=bool(output))
+        if dev:
+            params["developerInstructions"] = dev
         try:
             res = self.client.request("thread/start", params, 120)
         except Exception:
@@ -941,6 +945,8 @@ class Lens:
         tid = th["id"]
         self.client.loaded.add(tid)
         entry = {"created_at": _now(), "cwd": cwd, "model": model, "effort": effort, "agent": agent, "tier": tier}
+        if output:
+            entry["output"] = output   # 최종 답을 agent-output 규약으로 강제한다(output_protocol.py) — 이 세션의 모든 턴
         if wt:
             entry["worktree"] = {k: wt[k] for k in ("path", "branch", "repo", "origin_cwd", "base_branch", "base")}
         self.registry.update(lambda d: d["mine"].__setitem__(tid, entry))
@@ -1001,7 +1007,9 @@ class Lens:
         with self.lock:
             if self._running(tid):
                 raise Busy("응답하는 중입니다 — 끝나거나 멈춘 뒤 보내세요")
-        self.client.ensure_loaded(tid, developerInstructions=self.dev_instructions)
+        agent = self.client.agent_of(tid)
+        output = self.output_on(tid)
+        self.client.ensure_loaded(tid, developerInstructions=self.instructions_for(tid, agent, output=output))
         model = self._model_for(tid, model)
         inputs = self.build_input(text, mentions, tid, images=images)
         with self.lock:
@@ -1016,8 +1024,11 @@ class Lens:
             params["model"] = model
         if effort:
             params["effort"] = effort
-        if tier and self.client.agent_of(tid) != "claude":   # 속도 등급은 Codex 만 받는다
+        if tier and agent != "claude":   # 속도 등급은 Codex 만 받는다
             params["serviceTier"] = tier
+        if output and agent != "claude":
+            # 최종 메시지를 규약 스키마로 제약 디코딩한다 — 턴마다 준다(Claude 는 어댑터가 --json-schema 로 건다)
+            params["outputSchema"] = output_protocol.SCHEMA
         t0 = _now()
         try:
             res = self.client.request("turn/start", params, 120)
@@ -1039,6 +1050,18 @@ class Lens:
         applog.log("turn_start", thread=tid, turn=lt.turn_id, ms=int((_now() - t0) * 1000), model=model, effort=effort, tier=tier,
                    chars=len(text or ""), mentions=len(mentions or []), image_count=len(images or []))
         return out
+
+    def output_on(self, tid):
+        """이 세션의 최종 답을 agent-output 규약으로 강제하는지 — 이 앱이 규약을 걸고 만든 세션만."""
+        entry = self.registry.read()["mine"].get(tid) if tid else None
+        return bool(entry and entry.get("output"))
+
+    def instructions_for(self, tid, agent, output=None):
+        """세션에 줄 개발자 지침 — 포트 안내(App 이 채움)와 규약 지시문. 없으면 None."""
+        if output is None:
+            output = self.output_on(tid)
+        rules = output_protocol.RULES["claude" if agent == "claude" else "codex"] if output else None
+        return output_protocol.join_instructions(self.dev_instructions, rules)
 
     def _model_for(self, tid, model):
         """다른 에이전트의 모델이면 넘기지 않는다(예: 문서 다듬기에서 연결된 Claude 세션에 Codex 모델을 고른 경우)."""

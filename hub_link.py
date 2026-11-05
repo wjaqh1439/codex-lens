@@ -94,7 +94,7 @@ class HubLink:
         return {"chat_id": c["id"], "status": c.get("status"), "running": c.get("status") == "running",
                 "pending": int(c.get("pending") or 0), "profile": c.get("profile"), "url": self.url,
                 # agent-hub 는 expected_session_id 를 글자 그대로 맞춰 본다 — 그쪽 표기를 그대로 돌려준다
-                "session_id": c.get("session_id")}
+                "session_id": c.get("session_id"), "via": "agent-hub"}
 
     def forget(self):
         with self.lock:
@@ -122,7 +122,7 @@ class HubLink:
         res = self._call("POST", "/api/chats/%s/send" % chat["chat_id"], body, timeout=30)
         ev = res.get("event") or {}
         self.forget()
-        out = {"id": session_id, "hub": chat["chat_id"], "steered": bool(ev.get("steered")),
+        out = {"id": session_id, "hub": chat["chat_id"], "via": "agent-hub", "steered": bool(ev.get("steered")),
                "queued": bool(ev.get("queued")) and not ev.get("steered")}
         if client_id:
             self.sent[client_id] = out
@@ -135,4 +135,4 @@ class HubLink:
         self._call("POST", "/api/chats/%s/kill" % chat["chat_id"], {"expected_session_id": chat["session_id"]}, timeout=15)
         self.forget()
         applog.log("hub_interrupt", thread=session_id, chat=chat["chat_id"])
-        return {"ok": True, "hub": chat["chat_id"]}
+        return {"ok": True, "hub": chat["chat_id"], "via": "agent-hub"}

@@ -11,6 +11,8 @@ import os
 import re
 import shlex
 
+import output_protocol
+
 OUTPUT_LIMIT = 4000      # 명령 출력·도구 결과를 화면에 실을 최대 글자
 DIFF_LIMIT = 6000
 
@@ -93,7 +95,11 @@ def parse_output(text):
 def unwrap_output(text):
     """최종 출력 규약({"protocol":"agent-output/1","body":…})으로 쓴 답은 본문만 꺼낸다."""
     out = parse_output(text)
-    return text if out is None else out["body"]
+    if out is not None:
+        return out["body"]
+    # 받는 중(아직 닫히지 않은) 규약 JSON — 지금까지 온 본문만 보인다
+    part = output_protocol.partial_body(text)
+    return text if part is None else part
 
 
 def output_report(text):

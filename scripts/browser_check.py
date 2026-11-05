@@ -138,6 +138,7 @@ def main():
     parser.add_argument("--hub-only", action="store_true", help="agent-hub 가 돌리는 세션의 바로 넣기·턴 끝나고·멈춤 검사(가짜 허브)")
     parser.add_argument("--outputs-only", action="store_true", help="최종 출력 카드(할 일·정할 것·메인 반영)의 선택·보존·전송 검사")
     parser.add_argument("--restart-only", action="store_true", help="서버 재시작 중 띠·요청 자동 재전송 검사(서버를 내렸다 올린다)")
+    parser.add_argument("--fde-only", action="store_true", help="FDE 케이스 화면(#/case)의 단계 · 선택지 · 피드백 · 검증 · 뒤로 가기 검사")
     parser.add_argument("--resend-only", action="store_true", help="앱이 다시 뜨는 동안(앞단 502) 보낸 글이 돌아오면 한 번만 다시 가는지 검사")
     args = parser.parse_args()
     os.makedirs(OUT, exist_ok=True)
@@ -226,12 +227,15 @@ def main():
             # tailscale serve 처럼 앞단에 서서, 앱이 내려간 동안은 글자 본문의 502 를 돌려준다
             proxy = DownProxy(url)
             url = proxy.url
-        script_name = "e2e_hub.mjs" if args.hub_only else "e2e_speed.mjs" if args.speed_only else "e2e_outputs.mjs" if args.outputs_only else "e2e_archive.mjs" if args.archive_only else "e2e_restart.mjs" if args.restart_only else "e2e_resend.mjs" if args.resend_only else "e2e_external.mjs" if args.external else "e2e_web_navigation.mjs" if args.web_only else "e2e_sessions.mjs" if args.sessions_only else "e2e_mentions.mjs" if args.mentions_only else "e2e_read.mjs" if args.read_only else "e2e_images.mjs" if args.images_only else "e2e_browser.mjs"
+        fde_cwd = os.path.join(home, "plant-inspection")
+        if args.fde_only:
+            subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "fde_seed.py"), fde_cwd], check=True)
+        script_name = "e2e_fde.mjs" if args.fde_only else "e2e_hub.mjs" if args.hub_only else "e2e_speed.mjs" if args.speed_only else "e2e_outputs.mjs" if args.outputs_only else "e2e_archive.mjs" if args.archive_only else "e2e_restart.mjs" if args.restart_only else "e2e_resend.mjs" if args.resend_only else "e2e_external.mjs" if args.external else "e2e_web_navigation.mjs" if args.web_only else "e2e_sessions.mjs" if args.sessions_only else "e2e_mentions.mjs" if args.mentions_only else "e2e_read.mjs" if args.read_only else "e2e_images.mjs" if args.images_only else "e2e_browser.mjs"
         with open(os.path.join(ROOT, "scripts", script_name)) as f:
             body = f.read()
-        head = "const BASE = %s;\nconst OUT = %s;\nconst PROJ = %s;\nconst LAYOUT_ONLY = %s;\nconst HUB = %s;\nconst HUB_SESSION = %s;\n" % (
+        head = "const BASE = %s;\nconst OUT = %s;\nconst PROJ = %s;\nconst LAYOUT_ONLY = %s;\nconst HUB = %s;\nconst HUB_SESSION = %s;\nconst FDE_CWD = %s;\n" % (
             json.dumps(url), json.dumps(OUT), json.dumps(os.path.join(home, "sample-project")), json.dumps(args.layout_only),
-            json.dumps(hub_url), json.dumps(HUB_SESSION))
+            json.dumps(hub_url), json.dumps(HUB_SESSION), json.dumps(fde_cwd))
         script = os.path.join(OUT, "run.mjs")
         with open(script, "w") as f:
             f.write(head + body)

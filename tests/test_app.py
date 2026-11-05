@@ -21,6 +21,7 @@ for k in list(os.environ):
 os.environ["CODEX_LENS_HOME"] = os.path.join(TMP, "home")
 os.environ["CODEX_LENS_FEEDBACK_ORIGIN"] = ""
 os.environ["CODEX_LENS_HUB_URL"] = ""   # 진짜 agent-hub 에 닿지 않는다(허브 연동은 가짜 허브로 따로 본다)
+os.environ["CODEX_LENS_STEWARD_HOME"] = ""   # 진짜 steward 에도 닿지 않는다(가짜 steward 로 따로 본다)
 os.environ["CODEX_LENS_PORT_RANGE"] = "29400-29499"   # 시험용 대역 — 운영 대역과 겹치지 않게
 os.environ["CODEX_LENS_PORT_EXPOSE"] = ""   # 진짜 tailscale serve 매핑을 만들지 않는다(기본 내보내기 끔)
 os.environ["CODEX_LENS_EXTERNAL_WATCH_SEC"] = "0.15"   # 다른 곳의 턴이 끝났는지 서버가 확인하는 간격(운영 기본 3초)
@@ -2182,6 +2183,70 @@ class HubSteerTest(unittest.TestCase):
         self.assertEqual(st, 400)                                  # 이 앱이 돌리는 턴도 없다
 
 
+class StewardSteerTest(unittest.TestCase):
+    """steward 가 돌리는 세션: 응답 중 바로 넣기·턴 끝나고·멈춤을 steward 관제 API 로 넘긴다(agent-hub 와 같은 길)."""
+    SID = HubSteerTest.SID
+
+    def setUp(self):
+        from steward_link import StewardLink
+        from fake_steward import FakeSteward
+        self.dir = tempfile.mkdtemp(prefix="lens-steward-")
+        self.st = FakeSteward(self.dir, [
+            {"id": "ses_idle", "phase": "idle", "agent_session_id": self.SID, "updated_at": "2026-11-05T09:00:00Z"},
+            {"id": "ses_run", "phase": "running", "agent_session_id": self.SID, "updated_at": "2026-11-05T09:20:00Z",
+             "profile": "claude", "turn": {"id": "trn_1", "state": "running"}}]).start()
+        self.saved = SRV.app.steward
+        SRV.app.steward = StewardLink(self.dir)
+
+    def tearDown(self):
+        SRV.app.steward = self.saved
+        self.st.httpd.shutdown()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_read_marks_steward_running(self):
+        st, d = SRV.req("GET", "/api/sessions/%s" % self.SID)
+        self.assertEqual(st, 200)
+        self.assertEqual((d["hub"]["chat_id"], d["hub"]["running"], d["hub"]["via"]), ("ses_run", True, "steward"))
+        self.assertEqual(self.st.auth[-1], "Bearer tok-1")
+
+    def test_send_and_queue_go_to_steward(self):
+        before = len(claude_calls())
+        body = {"text": "README 도 봐", "client_id": "st-c1", "mode": "steer",
+                "images": [{"url": "data:image/png;base64," + __import__("base64").b64encode(seed.image_fixture()).decode()}]}
+        st, r = SRV.req("POST", "/api/sessions/%s/turns" % self.SID, body)
+        self.assertEqual(st, 200, r)
+        self.assertEqual((r["hub"], r["via"], r["steered"], r["queued"]), ("ses_run", "steward", True, False))
+        path, sent = self.st.calls[-1]
+        self.assertEqual(path, "/v1/sessions/ses_run/turns")
+        self.assertEqual((sent["mode"], sent["request_id"], sent["input"]["text"]), ("steer", "lens-st-c1", "README 도 봐"))
+        self.assertEqual(self.st.blobs, [seed.image_fixture()])                # 이미지는 첨부(blob)로 올리고 해시로 보낸다
+        self.assertEqual(sent["input"]["attachments"][0]["mime"], "image/png")
+        self.assertEqual(len(claude_calls()), before)                          # 이 앱은 claude 를 띄우지 않았다
+        n = len(self.st.calls)
+        self.assertEqual(SRV.req("POST", "/api/sessions/%s/turns" % self.SID, body), (200, r))
+        self.assertEqual(len(self.st.calls), n)                                # 같은 client_id 는 한 번만
+        st, r = SRV.req("POST", "/api/sessions/%s/turns" % self.SID, {"text": "끝나면", "client_id": "st-q1", "mode": "queue"})
+        self.assertEqual((st, r["queued"], self.st.calls[-1][1]["mode"]), (200, True, "queue"))
+
+    def test_interrupt_goes_to_steward(self):
+        st, r = SRV.req("POST", "/api/sessions/%s/interrupt" % self.SID, {})
+        self.assertEqual((st, r.get("hub"), r.get("via")), (200, "ses_run", "steward"))
+        self.assertEqual(self.st.calls[-1], ("/v1/sessions/ses_run/cancel", {"turn_id": "trn_1"}))
+
+    def test_idle_or_down_steward_leaves_session_alone(self):
+        from steward_link import StewardLink
+        self.st.sessions[1]["phase"] = "idle"
+        SRV.app.steward.forget()
+        st, d = SRV.req("GET", "/api/sessions/%s" % self.SID)
+        self.assertEqual((st, d["hub"]), (200, None))
+        os.unlink(os.path.join(self.dir, "control", "endpoint.json"))         # 관제가 꺼졌다 — 읽기는 그대로 된다
+        SRV.app.steward = StewardLink(self.dir)
+        st, d = SRV.req("GET", "/api/sessions/%s" % self.SID)
+        self.assertEqual((st, d["hub"]), (200, None))
+        st, r = SRV.req("POST", "/api/sessions/%s/interrupt" % self.SID, {})
+        self.assertEqual(st, 400)
+
+
 class ExternalQueueTest(unittest.TestCase):
     """다른 곳(이 앱 밖)에서 도는 턴: 응답 중과 같은 두 선택지(바로 넣기·턴 끝나고)를 받고 둘 다 대기열에 둔다.
     그 턴이 끝나면 서버가 화면 없이도 대기열을 한 번씩만 보낸다. 멈춤·실패·끊김 뒤에는 보내지 않는다."""
@@ -2316,3 +2381,94 @@ class ClaudeHistoryEndTest(unittest.TestCase):
         # 일반 도구 결과로 끝난 기록은 여전히 다른 곳에서 진행 중으로 본다
         turns, _ = claude_history.build_turns(recs[:3], mtime=time.time())
         self.assertEqual(turns[-1]["status"], "inProgress")
+
+
+class OutputProtocolTest(unittest.TestCase):
+    """이 앱이 혼자 최종 답을 agent-output/1 로 강제한다(output_protocol.py) — 다른 프로그램(agent-hub) 없이."""
+
+    def _done(self, sid, n):
+        def f():
+            d = SRV.req("GET", "/api/sessions/" + sid)[1]
+            t = d.get("turns") or []
+            return d if len(t) == n and t[-1]["status"] == "completed" and not (t[-1].get("live") or {}).get("status") else None
+        return wait(f)
+
+    def test_partial_body_streams_only_body(self):
+        import output_protocol as op
+        full = json.dumps({"protocol": "agent-output/1", "body": "줄1\n\"인용\" \\ 😀 끝", "todos": [], "decisions": [], "merge": None},
+                          ensure_ascii=True)
+        for cut in range(1, len(full)):
+            part = op.partial_body(full[:cut])
+            self.assertIsNotNone(part, full[:cut])
+            self.assertTrue("줄1\n\"인용\" \\ 😀 끝".startswith(part), (full[:cut], part))
+        self.assertEqual(unwrap_output(full), "줄1\n\"인용\" \\ 😀 끝")
+        self.assertEqual(unwrap_output(full[:full.index("todos")]), "줄1\n\"인용\" \\ 😀 끝")   # 본문까지 받은 중간
+        self.assertEqual(unwrap_output('{"protocol":"agent-output/1","bo'), "")              # 본문 키 전
+        self.assertEqual(unwrap_output("평소 답입니다"), "평소 답입니다")
+        self.assertEqual(unwrap_output('{"a": 1, "b": [1, 2, 3], "c": "그대로 보이는 JSON 답입니다"}'),
+                         '{"a": 1, "b": [1, 2, 3], "c": "그대로 보이는 JSON 답입니다"}')
+        # 안쪽 객체의 body 키는 본문이 아니다
+        self.assertEqual(op.partial_body('{"protocol":"agent-output/1","x":{"body":"아님"},"body":"맞음'), "맞음")
+
+    def test_codex_new_session_enforces_schema_and_cards(self):
+        st, r = SRV.req("POST", "/api/sessions", {"cwd": PROJ, "text": "카드로 답해 줘", "client_id": "op-cx-1"})
+        self.assertEqual(st, 200, r)
+        sid = r["id"]
+        d = self._done(sid, 1)
+        start = [c for c in calls("thread/start") if c["params"].get("cwd") == PROJ][-1]["params"]
+        self.assertIn("agent-output/1", start["developerInstructions"])
+        self.assertIn("lens-port run", start["developerInstructions"])           # 포트 지침과 같이 간다
+        ts = [c["params"] for c in calls("turn/start") if c["params"].get("threadId") == sid]
+        self.assertEqual(ts[-1]["outputSchema"]["required"], ["protocol", "body", "todos", "decisions", "merge"])
+        ans = d["turns"][0]["answer"]
+        self.assertFalse(ans["text"].lstrip().startswith("{"), ans["text"])     # 본문만 보인다
+        self.assertEqual([x["title"] for x in ans["report"]["todos"]], ["데모 서버 내리기"])
+        self.assertEqual(ans["report"]["decisions"][0]["header"], "적용 범위")
+        self.assertEqual(ans["report"]["merge"]["bump"], "minor")
+        self.assertEqual(SRV.lens.registry.read()["mine"][sid]["output"], "agent-output/1")
+        # 다음 턴에도 턴마다 스키마를 준다
+        st, r2 = SRV.req("POST", "/api/sessions/%s/turns" % sid, {"text": "고마워", "client_id": "op-cx-2"})
+        self.assertEqual(st, 200, r2)
+        d = self._done(sid, 2)
+        ts = [c["params"] for c in calls("turn/start") if c["params"].get("threadId") == sid]
+        self.assertTrue(ts[-1].get("outputSchema"))
+        self.assertNotIn("report", d["turns"][1]["answer"])     # 할 일·정할 것이 없으면 카드도 없다
+
+    def test_codex_outside_session_is_not_forced(self):
+        """밖에서 만든 세션은 그 세션의 원래 조건을 지킨다 — 규약을 걸지 않는다."""
+        st, r = SRV.req("POST", "/api/sessions/%s/turns" % S1, {"text": "밖 세션에 한마디", "client_id": "op-out-1"})
+        self.assertEqual(st, 200, r)
+        wait(lambda: [c for c in calls("turn/start") if c["params"].get("clientUserMessageId") == "op-out-1"])
+        p = [c["params"] for c in calls("turn/start") if c["params"].get("clientUserMessageId") == "op-out-1"][-1]
+        self.assertNotIn("outputSchema", p)
+        wait(lambda: not SRV.lens._running(S1), timeout=15)
+
+    def test_claude_new_session_enforces_json_schema(self):
+        st, r = SRV.req("POST", "/api/sessions", {"cwd": PROJ, "text": "카드로 답해 줘", "client_id": "op-cl-1", "agent": "claude"})
+        self.assertEqual(st, 200, r)
+        sid = r["id"]
+        d = self._done(sid, 1)
+        a = [c for c in claude_calls() if c.get("thread_env") == sid][-1]["argv"]
+        schema = json.loads(a[a.index("--json-schema") + 1])
+        self.assertEqual(schema["properties"]["protocol"]["enum"], ["agent-output/1"])
+        hint = a[a.index("--append-system-prompt") + 1]
+        self.assertIn("StructuredOutput", hint)
+        self.assertIn("lens-port run", hint)
+        t = d["turns"][0]
+        self.assertFalse(t["answer"]["text"].lstrip().startswith("{"), t["answer"]["text"])
+        self.assertEqual(t["answer"]["report"]["decisions"][0]["options"][0]["label"], "새 세션만")
+        self.assertNotIn("StructuredOutput", json.dumps(t["process"], ensure_ascii=False))   # 답 도구는 과정에 안 보인다
+        # 포크(과정 요약)도 같은 스키마·지침으로 돌아야 원본 캐시를 읽는다 — 읽기 전용이어도 답 도구는 허락한다
+        st, r3 = SRV.req("POST", "/api/sessions/%s/summaries" % sid, {"turn_id": t["id"], "request": "요약", "client_id": "op-cl-sum"})
+        self.assertEqual(st, 200, r3)
+        job = job_done("op-cl-sum")
+        self.assertEqual(job["status"], "done", job)
+        self.assertFalse((job.get("answer") or "").lstrip().startswith("{"), job.get("answer"))
+        fa = claude_calls()[-1]["argv"]
+        self.assertEqual(fa[fa.index("--json-schema") + 1], a[a.index("--json-schema") + 1])
+        self.assertEqual(fa[fa.index("--append-system-prompt") + 1], hint)
+
+    def test_claude_enforce_line_is_not_a_request(self):
+        import claude_history as ch
+        rec = {"type": "user", "message": {"role": "user", "content": "[structured-output-enforce] You must call the StructuredOutput tool"}}
+        self.assertIsNone(ch.prompt_of(rec))

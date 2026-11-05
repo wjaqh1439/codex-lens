@@ -23,6 +23,7 @@ from datetime import datetime
 from turns import quiet_until
 
 AGENT_OUTPUT = "agent-output"
+ENFORCE_PREFIX = "[structured-output-enforce]"   # output_protocol.ENFORCE_PREFIX 와 같다
 INTERRUPT_MARKS = ("[Request interrupted by user", "[Request cancelled by user")
 BASH_TIMEOUT_MS = 120000  # Claude Code Bash 도구의 기본 제한 시간(입력에 timeout 이 없을 때)
 LIVE_GRACE_SEC = 300      # 다른 곳(CLI)에서 도는 세션: 마지막 기록이 도구 단계이고 이만큼 안에 바뀌었으면 진행 중으로 본다
@@ -260,6 +261,8 @@ def prompt_of(rec):
     s = text.lstrip()
     if s.startswith("<local-command-stdout>") or s.startswith("<local-command-stderr>") or s.startswith("Caveat:"):
         return None
+    if s.startswith(ENFORCE_PREFIX):
+        return None   # --json-schema 세션에서 최종 답 도구를 부르지 않고 끝내려 할 때 CLI 가 넣는 줄 — 사람의 요청이 아니다
     if "<command-name>" in s:
         m = _CMD.search(s)
         a = _ARGS.search(s)

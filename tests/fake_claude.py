@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fake_app_server import fake_answer  # noqa: E402
+from fake_app_server import fake_answer, protocol_answer  # noqa: E402
 
 ROOT = os.path.abspath(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude-fake"))
 DELAY = float(os.environ.get("FAKE_CLAUDE_DELAY") or 0.03)
@@ -89,6 +89,7 @@ def main():
     resume, sid = arg(argv, "--resume"), arg(argv, "--session-id")
     persist = "--no-session-persistence" not in argv
     read_only = arg(argv, "--permission-mode") == "dontAsk"
+    schema = "--json-schema" in argv   # 진짜처럼 최종 답을 StructuredOutput 도구 호출로 낸다
     cwd = os.path.realpath(os.getcwd())
     pdir = os.path.join(ROOT, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
     if resume:
@@ -187,6 +188,9 @@ def main():
         answer = fake_answer(text, steer_texts)
         m2 = "msg_" + uuid.uuid4().hex[:10]
         send({"type": "stream_event", "event": {"type": "message_start", "message": {"id": m2}}})
+        if schema:
+            structured_answer(ses, sid, model, m2, protocol_answer(text, answer), resumed_same_model)
+            continue
         send({"type": "stream_event", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}})
         for i in range(0, len(answer), 16):
             if i == 128:
@@ -206,6 +210,32 @@ def main():
               "usage": {"input_tokens": 12, "cache_creation_input_tokens": 200,
                         "cache_read_input_tokens": 1000 if resumed_same_model else 0, "output_tokens": 80,
                         "output_tokens_details": {"thinking_tokens": 10}}})
+
+
+def structured_answer(ses, sid, model, mid, raw, resumed_same_model):
+    """--json-schema 로 띄운 턴의 답 — StructuredOutput 도구 입력이 흘러오고, 도구 결과·result.structured_output 이 따른다."""
+    tool_id = "toolu_" + uuid.uuid4().hex[:12]
+    send({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                                            "content_block": {"type": "tool_use", "id": tool_id, "name": "StructuredOutput", "input": {}}}})
+    for i in range(0, len(raw), 24):
+        send({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                                                "delta": {"type": "input_json_delta", "partial_json": raw[i:i + 24]}}})
+        time.sleep(float(os.environ.get('FAKE_STREAM_DELAY') or DELAY / 5))
+    obj = json.loads(raw)
+    usage = {"input_tokens": 12, "cache_creation_input_tokens": 200,
+             "cache_read_input_tokens": 1000 if resumed_same_model else 0, "output_tokens": 80}
+    am = {"id": mid, "model": model, "content": [{"type": "tool_use", "id": tool_id, "name": "StructuredOutput", "input": obj}],
+          "stop_reason": "tool_use", "usage": usage}
+    send({"type": "assistant", "message": am, "session_id": sid, "uuid": str(uuid.uuid4())})
+    ses.rec("assistant", message=am, apiBlockIndex=0)
+    result = {"type": "tool_result", "tool_use_id": tool_id, "content": "Structured output provided successfully"}
+    um = {"role": "user", "content": [result]}
+    send({"type": "user", "message": um, "session_id": sid, "uuid": str(uuid.uuid4())})
+    ses.rec("user", message=um, toolUseResult="Structured output provided successfully")
+    ses.rec("system", subtype="stop_hook_summary")
+    send({"type": "result", "subtype": "success", "is_error": False, "result": "", "structured_output": obj, "session_id": sid,
+          "terminal_reason": "completed", "modelUsage": {model: {"contextWindow": 200000}},
+          "usage": dict(usage, output_tokens_details={"thinking_tokens": 10})})
 
 
 if __name__ == "__main__":

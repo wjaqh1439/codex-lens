@@ -2,11 +2,15 @@
 
 127.0.0.1·localhost 는 화면을 보는 기기 자신을 가리켜, 휴대폰에서 누르면 앱 서버 기기의 데모 서버에 닿지 않는다.
 이 기기(앱 서버)의 포트면 tailscale serve 의 HTTPS 매핑(`https://<호스트>:<포트> → http://127.0.0.1:<포트>`)을 찾아 그 주소로 바꾼다.
-매핑을 새로 만들지는 않는다. tailscale 이 없으면 바꾸지 않고 이유만 돌려준다.
+매핑을 새로 만들지는 않는다. 매핑이 없으면(tailscale 이 없는 기기 등) 화면이 앱을 연 주소를 본다 —
+e2b `https://8761-<샌드박스>.e2b.app` 처럼 호스트 이름에 앱 포트가 들어 있으면 그 자리를 대상 포트로 바꾸고,
+아니면 같은 호스트 이름으로 그 포트에 닿을 때 `http://<그 호스트>:<포트>` 로 바꾼다(앱을 0.0.0.0 에 묶으면 lens-port
+서버도 0.0.0.0 에 묶인다). 그것도 안 되면 바꾸지 않고 이유만 돌려준다.
 """
 import ipaddress
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -111,10 +115,55 @@ def https_for_port(serve, port):
     return None
 
 
-def resolve(url, info=None, up=None, public_for=None):
+def reachable(host, port, timeout=0.5):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def split_host(host_header):
+    """`Host` 헤더 → 호스트 이름(대괄호 없는 IPv6 포함). 이상하면 None."""
+    try:
+        return urllib.parse.urlsplit("//" + (host_header or "").strip()).hostname
+    except ValueError:
+        return None
+
+
+def _is_ip(h):
+    try:
+        ipaddress.ip_address((h or "").strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def proxied_origin(via_origin, app_port, port):
+    """앱을 연 주소가 포트 번호를 호스트 이름에 담는 프록시면 그 자리만 바꾼 origin — 아니면 None.
+    e2b `https://8761-<샌드박스>.e2b.app`, Codespaces `https://<이름>-8761.app.github.dev`,
+    Gitpod `https://8761-<id>.<지역>.gitpod.io` 처럼 첫 이름 칸에 앱 포트가 숫자 낱말로 들어 있을 때만 본다."""
+    try:
+        v = urllib.parse.urlsplit(via_origin or "")
+        host = v.hostname
+    except ValueError:
+        return None
+    if v.scheme not in ("http", "https") or not host or not app_port or _is_ip(host) or is_loopback(host):
+        return None
+    first, dot, rest = host.partition(".")
+    pat = r"(?<![0-9])%d(?![0-9])" % int(app_port)
+    if not dot or len(re.findall(pat, first)) != 1:
+        return None
+    netloc = re.sub(pat, str(int(port)), first) + "." + rest + (":%d" % v.port if v.port else "")
+    return "%s://%s" % (v.scheme, netloc)
+
+
+def resolve(url, info=None, up=None, public_for=None, via=None, app_port=None, reach=None):
     """→ {"url": 열 주소, "changed": bool, "reason": None|"bad"|"down"|"no_https"|"no_tailscale", "local": bool}.
     public_for(port) 는 포트 관리(ports.py)가 그 포트에 붙인 바깥 주소 — 있으면 tailscale 매핑보다 먼저 쓴다.
-    info·up 은 시험용으로 바꿔 끼운다(기본은 tailscale CLI·실제 포트 접속)."""
+    via 는 화면이 앱을 연 origin(location.origin), app_port 는 앱이 듣는 포트 — HTTPS 매핑이 없으면
+    ① 포트를 호스트 이름에 담는 프록시(e2b 등)면 그 자리를 바꾼 주소 ② 아니면 같은 호스트 이름으로 그 포트에 닿는지 본다.
+    info·up·reach 는 시험용으로 바꿔 끼운다(기본은 tailscale CLI·실제 포트 접속)."""
     orig = url
     try:
         u = urllib.parse.urlsplit(url or "")
@@ -142,9 +191,18 @@ def resolve(url, info=None, up=None, public_for=None):
         p = urllib.parse.urlsplit(pub)
         if p.scheme in ("http", "https") and p.netloc:
             return {"url": "%s://%s%s" % (p.scheme, p.netloc, rest), "changed": True, "reason": None, "local": True}
-    if serve is None:
-        return {"url": url, "changed": url != orig, "reason": "no_tailscale", "local": True}
-    origin = https_for_port(serve, port)
-    if not origin:
-        return {"url": url, "changed": url != orig, "reason": "no_https", "local": True}
-    return {"url": origin + rest, "changed": True, "reason": None, "local": True}
+    origin = https_for_port(serve, port) if serve is not None else None
+    if origin:
+        return {"url": origin + rest, "changed": True, "reason": None, "local": True}
+    prox = proxied_origin(via, app_port, port)
+    if prox:
+        return {"url": prox + rest, "changed": True, "reason": None, "local": True, "via": "proxy"}
+    try:
+        vh = urllib.parse.urlsplit(via or "").hostname or ""
+    except ValueError:
+        vh = ""
+    if vh and not is_loopback(vh) and not is_unspecified(vh) and (reach or reachable)(vh, port):
+        netloc = ("[%s]" % vh if ":" in vh else vh) + ":%d" % port
+        return {"url": "http://" + netloc + rest, "changed": True, "reason": None, "local": True, "via": "host"}
+    reason = "no_tailscale" if serve is None else "no_https"
+    return {"url": url, "changed": url != orig, "reason": reason, "local": True}
