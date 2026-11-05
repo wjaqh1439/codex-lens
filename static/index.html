@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ko" class="{{DEMO_CLASS}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#4c1d95">
+<title>{{TITLE}}</title>
+<link rel="icon" href="/icons/{{ICON}}favicon-32.png">
+<link rel="apple-touch-icon" href="/icons/{{ICON}}apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="stylesheet" href="/static/app.css?v={{VERSION}}">
+<script>window.CODEX_LENS = {{BOOT}};</script>
+</head>
+<body>
+<div id="demo-banner" class="demo-banner">데모 — 운영과 분리된 저장소를 씁니다</div>
+<header id="app-top">
+  <div class="top-title">
+    <button id="app-home" class="app-home" type="button" title="세션 목록">Codex Lens</button>
+    <div class="subtitle">Codex · Claude Code 세션</div>
+  </div>
+  <nav class="top-actions" aria-label="앱 메뉴">
+    <button id="app-projects" class="small" type="button">프로젝트</button>
+    <button id="app-models" class="small" type="button" title="모델 관리 — 기본 모델 · 숨김 · 속도">모델</button>
+    <button id="app-ports" class="small" type="button">포트</button>
+  </nav>
+  <button id="version" class="version-chip" type="button" title="변경 이력">v{{VERSION}}</button>
+</header>
+<div id="shell">
+  <aside id="side" aria-label="세션 목록"></aside>
+  <div id="splitter" role="separator" aria-orientation="vertical" aria-label="세션 폭 조절" tabindex="0"
+    title="끌어서 세션 폭 조절 · 두 번 누르면 기본 폭"></div>
+  <div id="pane">
+    <header id="top">
+      <button id="back" class="icon-btn" type="button" aria-label="뒤로" hidden>‹</button>
+      <button id="pane-back" class="icon-btn" type="button" aria-label="뒤로" title="오른쪽 창에서 뒤로" hidden>‹</button>
+      <div class="top-title">
+        <h1 id="title"></h1>
+        <div id="subtitle" class="subtitle"></div>
+        <div class="session-meta">
+          <span id="session-context" class="context-chip" hidden></span>
+          <button id="sid" class="id-chip top-id" type="button" title="세션 ID 복사" hidden></button>
+        </div>
+      </div>
+      <div id="top-actions" class="top-actions"></div>
+    </header>
+    <main id="view"></main>
+  </div>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<script src="/static/md.js?v={{VERSION}}"></script>
+<script src="/static/app.js?v={{VERSION}}"></script>
+{{FEEDBACK}}
+</body>
+</html>
